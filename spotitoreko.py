@@ -34,7 +34,8 @@ VERSION_KEYWORDS = [
     "demo", "bootleg", "extended", "piano", "stripped", "concert",
     "unplugged", "tour edition", "deluxe",
 ]
-SIMILARITY_THRESHOLD = 0.60
+SIMILARITY_THRESHOLD = 0.60   # below this → always prompt
+AUTO_SELECT_THRESHOLD = 0.90  # at or above this → always auto, even with keyword flags
 DURATION_TOLERANCE_S = 30
 REQUIRED_PACKAGES = ["requests", "spotipy", "ytmusicapi", "mutagen"]
 
@@ -693,7 +694,10 @@ def main():
 
             if candidates:
                 confidence, keywords = score_match(track, candidates[0])
-                should_ask = bool(keywords) or confidence < SIMILARITY_THRESHOLD
+                if confidence >= AUTO_SELECT_THRESHOLD:
+                    should_ask = False  # high confidence — skip prompt even if flags exist
+                else:
+                    should_ask = bool(keywords) or confidence < SIMILARITY_THRESHOLD
             else:
                 confidence, keywords = 0.0, []
                 should_ask = True
