@@ -1,0 +1,10 @@
+config.json
+downloaded.json
+.spotify_cache
+*.wav
+*.mp3
+*.flac
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
