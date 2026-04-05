@@ -8,6 +8,7 @@ import os
 import re
 import json
 import shutil
+import struct
 import tempfile
 import subprocess
 from pathlib import Path
@@ -35,6 +36,22 @@ VERSION_KEYWORDS = [
 SIMILARITY_THRESHOLD = 0.60
 DURATION_TOLERANCE_S = 30
 REQUIRED_PACKAGES = ["requests", "spotipy", "ytmusicapi", "mutagen"]
+
+# Spotify key integer (0-11) × mode (0=minor, 1=major) → readable key name
+KEY_NAMES = {
+    (0, 1): "C",    (0, 0): "Cm",
+    (1, 1): "C#",   (1, 0): "C#m",
+    (2, 1): "D",    (2, 0): "Dm",
+    (3, 1): "Eb",   (3, 0): "Ebm",
+    (4, 1): "E",    (4, 0): "Em",
+    (5, 1): "F",    (5, 0): "Fm",
+    (6, 1): "F#",   (6, 0): "F#m",
+    (7, 1): "G",    (7, 0): "Gm",
+    (8, 1): "Ab",   (8, 0): "Abm",
+    (9, 1): "A",    (9, 0): "Am",
+    (10, 1): "Bb",  (10, 0): "Bbm",
+    (11, 1): "B",   (11, 0): "Bm",
+}
 
 CONFIG_TEMPLATE = {
     "spotify_client_id": "PASTE_YOUR_CLIENT_ID_HERE",
@@ -214,6 +231,24 @@ def get_playlist_tracks(sp, playlist_id: str) -> list:
     except spotipy.exceptions.SpotifyException:
         print(f"  {GREY}(Genre metadata unavailable — Spotify API restriction){RESET}")
 
+    # Batch-fetch audio features: BPM and key (100 per request, non-fatal if restricted)
+    track_ids = [t["id"] for t in tracks]
+    audio_features_cache = {}
+    try:
+        for i in range(0, len(track_ids), 100):
+            chunk = track_ids[i:i + 100]
+            for af in (sp.audio_features(chunk) or []):
+                if af and af.get("id"):
+                    key_int = af.get("key", -1)
+                    mode = af.get("mode", -1)
+                    key_name = KEY_NAMES.get((key_int, mode), "") if key_int != -1 else ""
+                    audio_features_cache[af["id"]] = {
+                        "bpm": round(af.get("tempo", 0)) or 0,
+                        "key": key_name,
+                    }
+    except Exception:
+        print(f"  {GREY}(Audio features unavailable — Spotify API restriction){RESET}")
+
     normalized = []
     for t in tracks:
         artist_names = [a["name"] for a in t["artists"] if a.get("name")]
@@ -227,6 +262,7 @@ def get_playlist_tracks(sp, playlist_id: str) -> list:
         track_num = str(t.get("track_number", ""))
         total_tracks = str(album.get("total_tracks", ""))
         track_number = f"{track_num}/{total_tracks}" if track_num and total_tracks else track_num
+        af = audio_features_cache.get(t["id"], {})
 
         normalized.append({
             "id": t["id"],
@@ -240,6 +276,8 @@ def get_playlist_tracks(sp, playlist_id: str) -> list:
             "genres": genres,
             "duration_s": t.get("duration_ms", 0) // 1000,
             "cover_url": cover_url,
+            "bpm": af.get("bpm", 0),
+            "key": af.get("key", ""),
         })
 
     return normalized
@@ -368,11 +406,71 @@ def sanitize_filename(name: str) -> str:
 
 # ── Metadata ───────────────────────────────────────────────────────────────────
 
+def _riff_chunk(tag: bytes, data: bytes) -> bytes:
+    """Pack a RIFF sub-chunk with even-length padding."""
+    if len(data) % 2:
+        data += b"\x00"
+    return tag + struct.pack("<I", len(data)) + data
+
+
+def write_riff_info(filepath: Path, track: dict) -> None:
+    """Write a RIFF LIST INFO chunk into a WAV file.
+
+    This is the native WAV metadata format — reliably read by Rekordbox,
+    DAWs, and audio software that ignores ID3 chunks in WAV files.
+    """
+    fields = [
+        (b"INAM", track.get("title", "")),
+        (b"IART", track.get("artists") or track.get("artist", "")),
+        (b"IPRD", track.get("album", "")),
+        (b"ICRD", track.get("year", "")),
+        (b"IGNR", track["genres"][0] if track.get("genres") else ""),
+        (b"ITRK", (track.get("track_number") or "").split("/")[0]),
+        (b"ICMT", "Downloaded by SpotiToReko"),
+    ]
+    if track.get("bpm"):
+        fields.append((b"IBPM", str(track["bpm"])))
+    if track.get("key"):
+        fields.append((b"IKEY", track["key"]))
+
+    info_data = b"INFO"
+    for tag, value in fields:
+        if value:
+            info_data += _riff_chunk(tag, value.encode("utf-8") + b"\x00")
+
+    list_chunk = _riff_chunk(b"LIST", info_data)
+
+    data = filepath.read_bytes()
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return
+
+    # Rebuild the file, stripping any existing LIST INFO chunk
+    rebuilt = data[:12]
+    pos = 12
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        chunk_size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        padded = chunk_size + (chunk_size % 2)
+        end = pos + 8 + padded
+        if chunk_id == b"LIST" and data[pos + 8:pos + 12] == b"INFO":
+            pos = end
+            continue
+        rebuilt += data[pos:end]
+        pos = end
+
+    rebuilt += list_chunk
+    # Update the top-level RIFF size field
+    rebuilt = rebuilt[:4] + struct.pack("<I", len(rebuilt) - 8) + rebuilt[8:]
+    filepath.write_bytes(rebuilt)
+
+
 def write_metadata(filepath: Path, track: dict) -> bool:
     try:
         import requests as req
         from mutagen.wave import WAVE
-        from mutagen.id3 import TIT2, TPE1, TPE2, TALB, TDRC, TRCK, TCON, APIC, COMM
+        from mutagen.id3 import (
+            TIT2, TPE1, TPE2, TALB, TDRC, TRCK, TCON, TBPM, TKEY, APIC, COMM,
+        )
 
         audio = WAVE(str(filepath))
         if audio.tags is None:
@@ -389,6 +487,10 @@ def write_metadata(filepath: Path, track: dict) -> bool:
             tags["TRCK"] = TRCK(encoding=3, text=[track["track_number"]])
         if track.get("genres"):
             tags["TCON"] = TCON(encoding=3, text=[track["genres"][0]])
+        if track.get("bpm"):
+            tags["TBPM"] = TBPM(encoding=3, text=[str(track["bpm"])])
+        if track.get("key"):
+            tags["TKEY"] = TKEY(encoding=3, text=[track["key"]])
         tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=["Downloaded by SpotiToReko"])
 
         if track.get("cover_url"):
@@ -400,7 +502,12 @@ def write_metadata(filepath: Path, track: dict) -> bool:
             except Exception as e:
                 print(f"  {GREY}Cover art failed: {e}{RESET}")
 
-        audio.save()
+        # ID3v2.3 has broader compatibility with Rekordbox than the default v2.4
+        audio.save(v2_version=3)
+
+        # Also write native RIFF INFO chunk — read by Rekordbox and most DAWs
+        write_riff_info(filepath, track)
+
         return True
 
     except Exception as e:
