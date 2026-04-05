@@ -515,6 +515,24 @@ def write_metadata(filepath: Path, track: dict) -> bool:
         return False
 
 
+def needs_metadata(filepath: Path) -> bool:
+    """Return True if the WAV file is missing a RIFF LIST INFO chunk with a title."""
+    try:
+        data = filepath.read_bytes()
+        if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+            return False
+        pos = 12
+        while pos + 8 <= len(data):
+            chunk_id = data[pos:pos + 4]
+            chunk_size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+            if chunk_id == b"LIST" and data[pos + 8:pos + 12] == b"INFO":
+                return b"INAM" not in data[pos + 12:pos + 8 + chunk_size]
+            pos += 8 + chunk_size + (chunk_size % 2)
+        return True  # No LIST INFO chunk found
+    except Exception:
+        return False
+
+
 # ── Download ───────────────────────────────────────────────────────────────────
 
 def download_track(yt_url: str, track: dict, output_dir: str, ytdlp_bin: str) -> Path:
@@ -611,6 +629,7 @@ def main():
     print(f"{len(tracks)} tracks ({len(downloaded)} already downloaded)\n")
 
     count_downloaded = 0
+    count_patched = 0
     count_skipped = 0
     count_prompted = 0
     count_failed = 0
@@ -622,9 +641,29 @@ def main():
             print(f"[{i}/{len(tracks)}] {BOLD}{label}{RESET}")
 
             if track_id in downloaded:
-                print(f"  {GREY}- Already downloaded: {downloaded[track_id]}{RESET}")
-                count_skipped += 1
-                continue
+                filename = downloaded[track_id]
+                filepath = Path(output_dir) / filename
+
+                if not filepath.exists():
+                    # File was deleted or moved — remove from log and re-download
+                    print(f"  {YELLOW}File missing from disk, re-downloading...{RESET}")
+                    del downloaded[track_id]
+                    save_downloaded(output_dir, downloaded)
+                    # fall through to download logic below
+
+                elif needs_metadata(filepath):
+                    print(f"  {YELLOW}~ Patching metadata...{RESET}", end=" ", flush=True)
+                    if write_metadata(filepath, track):
+                        print(f"{GREEN}done{RESET}")
+                        count_patched += 1
+                    else:
+                        count_failed += 1
+                    continue
+
+                else:
+                    print(f"  {GREY}- Already downloaded: {filename}{RESET}")
+                    count_skipped += 1
+                    continue
 
             candidates = search_youtube_music(track, ytm)
 
@@ -665,6 +704,7 @@ def main():
 
     print(f"\n{'─' * 50}")
     print(f"  {GREEN}v Downloaded:  {count_downloaded}{RESET}")
+    print(f"  {YELLOW}~ Patched:     {count_patched}{RESET}")
     print(f"  {YELLOW}? Prompted:    {count_prompted}{RESET}")
     print(f"  {GREY}- Skipped:     {count_skipped}{RESET}")
     print(f"  {RED}x Failed:      {count_failed}{RESET}")
