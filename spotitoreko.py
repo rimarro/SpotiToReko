@@ -188,6 +188,7 @@ def load_config() -> dict:
 # Stored next to the script, not in output_dir, so it's always found regardless
 # of where output files are saved.
 _DOWNLOADED_PATH = Path(__file__).parent / "downloaded.json"
+_META_VERSION = 2  # bump this when the metadata pipeline changes
 
 
 def load_downloaded() -> dict:
@@ -195,11 +196,19 @@ def load_downloaded() -> dict:
         return {}
     try:
         raw = json.loads(_DOWNLOADED_PATH.read_text())
-        # Migrate old format {id: "filename"} → {id: {"file": "filename", "tagged": False}}
-        return {
-            tid: ({"file": v, "tagged": False} if isinstance(v, str) else v)
-            for tid, v in raw.items()
-        }
+        out = {}
+        for tid, v in raw.items():
+            if isinstance(v, str):
+                # Oldest format: bare filename string — never tagged
+                out[tid] = {"file": v, "ver": 0}
+            elif isinstance(v, dict) and "ver" not in v:
+                # Previous format used a "tagged" bool. Any entry written
+                # without "ver" was patched before strip_wav_metadata existed,
+                # so it needs to be re-processed regardless of tagged value.
+                out[tid] = {"file": v["file"], "ver": 0}
+            else:
+                out[tid] = v
+        return out
     except json.JSONDecodeError:
         return {}
 
@@ -663,12 +672,12 @@ def main():
                     save_downloaded(downloaded)
                     # fall through to download logic below
 
-                elif not entry.get("tagged", False):
+                elif entry.get("ver", 0) < _META_VERSION:
                     print(f"  {YELLOW}~ Patching metadata...{RESET}", end=" ", flush=True)
                     strip_wav_metadata(filepath)
                     if write_metadata(filepath, track):
                         print(f"{GREEN}done{RESET}")
-                        downloaded[track_id]["tagged"] = True
+                        downloaded[track_id]["ver"] = _META_VERSION
                         save_downloaded(downloaded)
                         count_patched += 1
                     else:
@@ -704,7 +713,7 @@ def main():
             final_path = download_track(chosen_url, track, output_dir, ytdlp_bin)
 
             if final_path:
-                downloaded[track_id] = {"file": final_path.name, "tagged": True}
+                downloaded[track_id] = {"file": final_path.name, "ver": _META_VERSION}
                 save_downloaded(downloaded)
                 marker = YELLOW if should_ask else GREEN
                 symbol = "?" if should_ask else "v"
