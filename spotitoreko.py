@@ -184,22 +184,24 @@ def load_config() -> dict:
 
 
 # ── Downloaded state ───────────────────────────────────────────────────────────
+# Stored next to the script, not in output_dir, so it's always found regardless
+# of where output files are saved.
+_DOWNLOADED_PATH = Path(__file__).parent / "downloaded.json"
 
-def load_downloaded(output_dir: str) -> dict:
-    path = Path(output_dir) / "downloaded.json"
-    if not path.exists():
+
+def load_downloaded() -> dict:
+    if not _DOWNLOADED_PATH.exists():
         return {}
     try:
-        return json.loads(path.read_text())
+        return json.loads(_DOWNLOADED_PATH.read_text())
     except json.JSONDecodeError:
         return {}
 
 
-def save_downloaded(output_dir: str, data: dict) -> None:
-    path = Path(output_dir) / "downloaded.json"
-    tmp_path = path.with_suffix(".tmp")
+def save_downloaded(data: dict) -> None:
+    tmp_path = _DOWNLOADED_PATH.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(data, indent=2))
-    os.replace(tmp_path, path)
+    os.replace(tmp_path, _DOWNLOADED_PATH)
 
 
 # ── Spotify ────────────────────────────────────────────────────────────────────
@@ -617,7 +619,7 @@ def main():
     sp = spotipy.Spotify(auth_manager=auth_manager)
     ytm = YTMusic()
 
-    downloaded = load_downloaded(output_dir)
+    downloaded = load_downloaded()
     print("  Loading playlist...", end=" ", flush=True)
     try:
         tracks = get_playlist_tracks(sp, config["playlist_id"])
@@ -648,7 +650,7 @@ def main():
                     # File was deleted or moved — remove from log and re-download
                     print(f"  {YELLOW}File missing from disk, re-downloading...{RESET}")
                     del downloaded[track_id]
-                    save_downloaded(output_dir, downloaded)
+                    save_downloaded(downloaded)
                     # fall through to download logic below
 
                 elif needs_metadata(filepath):
@@ -690,7 +692,7 @@ def main():
 
             if final_path:
                 downloaded[track_id] = final_path.name
-                save_downloaded(output_dir, downloaded)
+                save_downloaded(downloaded)
                 marker = YELLOW if should_ask else GREEN
                 symbol = "?" if should_ask else "v"
                 print(f"  {marker}{symbol} {final_path.name}{RESET}")
