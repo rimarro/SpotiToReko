@@ -11,6 +11,7 @@ import shutil
 import struct
 import tempfile
 import subprocess
+import wave
 from pathlib import Path
 from difflib import SequenceMatcher
 
@@ -413,6 +414,27 @@ def sanitize_filename(name: str) -> str:
 
 # ── Metadata ───────────────────────────────────────────────────────────────────
 
+def strip_wav_metadata(filepath: Path) -> None:
+    """Rebuild a WAV keeping only the raw audio — removes all existing tags.
+
+    yt-dlp writes its own ID3 and INFO chunks. Patching over them produces
+    a file layout Rekordbox can't always parse. Starting from clean audio
+    data guarantees metadata is written in the expected structure.
+    """
+    tmp = filepath.with_suffix(".tmp.wav")
+    try:
+        with wave.open(str(filepath), "rb") as src:
+            params = src.getparams()
+            frames = src.readframes(src.getnframes())
+        with wave.open(str(tmp), "wb") as dst:
+            dst.setparams(params)
+            dst.writeframes(frames)
+        os.replace(tmp, filepath)
+    except Exception as e:
+        print(f"  {GREY}(strip failed, patching in-place: {e}){RESET}")
+        if tmp.exists():
+            tmp.unlink()
+
 def _riff_chunk(tag: bytes, data: bytes) -> bytes:
     """Pack a RIFF sub-chunk with even-length padding."""
     if len(data) % 2:
@@ -643,6 +665,7 @@ def main():
 
                 elif not entry.get("tagged", False):
                     print(f"  {YELLOW}~ Patching metadata...{RESET}", end=" ", flush=True)
+                    strip_wav_metadata(filepath)
                     if write_metadata(filepath, track):
                         print(f"{GREEN}done{RESET}")
                         downloaded[track_id]["tagged"] = True
