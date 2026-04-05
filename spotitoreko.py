@@ -193,7 +193,12 @@ def load_downloaded() -> dict:
     if not _DOWNLOADED_PATH.exists():
         return {}
     try:
-        return json.loads(_DOWNLOADED_PATH.read_text())
+        raw = json.loads(_DOWNLOADED_PATH.read_text())
+        # Migrate old format {id: "filename"} → {id: {"file": "filename", "tagged": False}}
+        return {
+            tid: ({"file": v, "tagged": False} if isinstance(v, str) else v)
+            for tid, v in raw.items()
+        }
     except json.JSONDecodeError:
         return {}
 
@@ -517,24 +522,6 @@ def write_metadata(filepath: Path, track: dict) -> bool:
         return False
 
 
-def needs_metadata(filepath: Path) -> bool:
-    """Return True if the WAV file is missing a RIFF LIST INFO chunk with a title."""
-    try:
-        data = filepath.read_bytes()
-        if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-            return False
-        pos = 12
-        while pos + 8 <= len(data):
-            chunk_id = data[pos:pos + 4]
-            chunk_size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
-            if chunk_id == b"LIST" and data[pos + 8:pos + 12] == b"INFO":
-                return b"INAM" not in data[pos + 12:pos + 8 + chunk_size]
-            pos += 8 + chunk_size + (chunk_size % 2)
-        return True  # No LIST INFO chunk found
-    except Exception:
-        return False
-
-
 # ── Download ───────────────────────────────────────────────────────────────────
 
 def download_track(yt_url: str, track: dict, output_dir: str, ytdlp_bin: str) -> Path:
@@ -643,7 +630,8 @@ def main():
             print(f"[{i}/{len(tracks)}] {BOLD}{label}{RESET}")
 
             if track_id in downloaded:
-                filename = downloaded[track_id]
+                entry = downloaded[track_id]
+                filename = entry["file"]
                 filepath = Path(output_dir) / filename
 
                 if not filepath.exists():
@@ -653,10 +641,12 @@ def main():
                     save_downloaded(downloaded)
                     # fall through to download logic below
 
-                elif needs_metadata(filepath):
+                elif not entry.get("tagged", False):
                     print(f"  {YELLOW}~ Patching metadata...{RESET}", end=" ", flush=True)
                     if write_metadata(filepath, track):
                         print(f"{GREEN}done{RESET}")
+                        downloaded[track_id]["tagged"] = True
+                        save_downloaded(downloaded)
                         count_patched += 1
                     else:
                         count_failed += 1
@@ -691,7 +681,7 @@ def main():
             final_path = download_track(chosen_url, track, output_dir, ytdlp_bin)
 
             if final_path:
-                downloaded[track_id] = final_path.name
+                downloaded[track_id] = {"file": final_path.name, "tagged": True}
                 save_downloaded(downloaded)
                 marker = YELLOW if should_ask else GREEN
                 symbol = "?" if should_ask else "v"
